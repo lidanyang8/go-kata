@@ -3,55 +3,44 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"os"
-	"time"
-
 	"golang.org/x/sync/errgroup"
+	"log"
+	"time"
 )
 
-type UserService interface {
-	GetUserProfile(ctx context.Context, id int) (string, error)
-}
-
-type OrderService interface {
-	GetOrder(ctx context.Context, id int) (int, error)
-}
-
-type Option func(*UserAggregator)
+type UserAggregatorOption func(*UserAggregator)
 
 type UserAggregator struct {
-	user    UserService
-	order   OrderService
-	log     *slog.Logger
+	profile *ProfileService
+	order   *OrderService
+
 	timeout time.Duration
+	log     *log.Logger
 }
 
-func WithTimeout(t time.Duration) Option {
-	return func(u *UserAggregator) {
-		u.timeout = t
-	}
-}
-
-func NewUserAggregator(user UserService, order OrderService, opts ...Option) *UserAggregator {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
+func NewUserAggregator(profile *ProfileService, order *OrderService,
+	opts ...UserAggregatorOption) *UserAggregator {
+	logger := log.Default()
 	ua := &UserAggregator{
-		user:  user,
-		order: order,
-		log:   logger,
+		profile: profile,
+		order:   order,
+		log:     logger,
 	}
 
 	for _, opt := range opts {
 		opt(ua)
 	}
+
 	return ua
 }
 
-func (u *UserAggregator) Aggregate(ctx context.Context, id int) (string, error) {
+func WithTimeout(timeout time.Duration) UserAggregatorOption {
+	return func(ua *UserAggregator) {
+		ua.timeout = timeout
+	}
+}
 
+func (u *UserAggregator) Aggregate(ctx context.Context, id int) (string, error) {
 	if u.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, u.timeout)
@@ -59,54 +48,87 @@ func (u *UserAggregator) Aggregate(ctx context.Context, id int) (string, error) 
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
+
 	var (
-		username string
-		order    int
+		username = ""
+		order    = ""
 	)
 
 	g.Go(func() error {
-		name, err := u.user.GetUserProfile(ctx, id)
+		u.log.Println(fmt.Sprintf("ProfileService GetUsername(%d) begin start", id))
+		uname, err := u.profile.GetUsername(ctx, id)
 		if err != nil {
-			u.log.ErrorContext(ctx, fmt.Sprintf(
-				"failed to GetUserProfile(%d) error: %s", id, err.Error()))
+			u.log.Println(fmt.Sprintf("ProfileService GetUsername(%d) error: %s", id, err.Error()))
 			return err
 		}
-		username = name
-		u.log.InfoContext(ctx, fmt.Sprintf(
-			"GetUserProfile(%d) username is %s", id, username))
+		u.log.Println(fmt.Sprintf("ProfileService GetUsername(%d) success, result: %s", id, uname))
+		username = uname
 		return nil
 	})
 
 	g.Go(func() error {
-		orderTotal, err := u.order.GetOrder(ctx, id)
+		u.log.Println(fmt.Sprintf("OrderService GetOrderInfo(%d) begin start", id))
+		_order, err := u.order.GetOrderInfo(ctx, id)
 		if err != nil {
-			u.log.ErrorContext(ctx, fmt.Sprintf(
-				"failed to GetOrder(%d) error: %s", id, err.Error()))
+			u.log.Println(fmt.Sprintf("OrderService GetOrderInfo(%d) error: %s", id, err.Error()))
 			return err
 		}
-		order = orderTotal
-		u.log.InfoContext(ctx, fmt.Sprintf("GetOrder(%d) order is %d", id, order))
+		u.log.Println(fmt.Sprintf("OrderService GetOrderInfo(%d) success, result: %s", id, _order))
+		order = _order
 		return nil
 	})
 
 	if err := g.Wait(); err != nil {
-		u.log.ErrorContext(ctx, fmt.Sprintf(
-			"aggregation failed userId %d error: %s", id, err.Error()))
 		return "", err
 	}
 
-	result := fmt.Sprintf("User: %s | Orders: %d", username, order)
-	u.log.InfoContext(ctx, "aggregation succeeded", "userId", id, "result", result)
-	return result, nil
+	return fmt.Sprintf("User: %s | Orders: %s", username, order), nil
+}
+
+type ProfileService struct {
+	delay time.Duration
+}
+
+func (p *ProfileService) GetUsername(ctx context.Context, id int) (string, error) {
+	if p.delay <= 0 {
+		return "Alice", nil
+	}
+
+	select {
+	case <-time.After(p.delay):
+		return "Alice", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+type OrderService struct {
+	delay time.Duration
+}
+
+func (o *OrderService) GetOrderInfo(ctx context.Context, id int) (string, error) {
+	if o.delay <= 0 {
+		return "5", nil
+	}
+
+	select {
+	case <-time.After(o.delay):
+		return "5", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 func main() {
 
-	ua := NewUserAggregator(&mockUserService{}, &mockOrderService{}, WithTimeout(2*time.Second))
-	result, err := ua.Aggregate(context.Background(), 1001)
+	p := &ProfileService{delay: 150 * time.Millisecond}
+	o := &OrderService{delay: 200 * time.Millisecond}
+	ua := NewUserAggregator(p, o, WithTimeout(2*time.Second))
+	result, err := ua.Aggregate(context.Background(), 10)
 	if err != nil {
-		panic("failed to Aggregate: " + err.Error())
+		println("Aggregate failed ", err.Error())
 		return
 	}
-	println(result)
+
+	println("Aggregate result ", result)
 }

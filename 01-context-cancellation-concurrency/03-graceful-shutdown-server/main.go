@@ -2,183 +2,166 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 )
 
-var (
-	log = slog.Default()
-)
+type TaskRequest struct {
+	Id int
+}
 
-type Option func(server *Server)
+type ServerOption func(*Server)
 
 type Server struct {
-	addr         string        // http server address
-	workerCount  int           // workers count
-	timeout      time.Duration // server quit timeout
-	requestDelay time.Duration
+	Port        int
+	WorkerCount int
+	Timeout     time.Duration
+	Delay       time.Duration
 
-	taskRequestCh chan int      // tasks queue
-	quit          chan struct{} // quit sigint
-
-	ctx context.Context // 全局 context
-	wg  sync.WaitGroup  // close wait group
-
-	db         *net.Conn    // 数据库连接
-	httpServer *http.Server // http server
+	httpServer *http.Server
 	mux        *http.ServeMux
+	db         *net.TCPConn
+	log        *log.Logger
+	wg         *sync.WaitGroup
+	ctx        context.Context
+	quit       chan struct{}
+	tasks      chan *TaskRequest
+	closeOnce  sync.Once
 }
 
-func NewServer(addr string, workerCount int, opts ...Option) *Server {
+func NewServer(port, worker int, opts ...ServerOption) *Server {
 	mux := http.NewServeMux()
-	server := &Server{
-		addr:          addr,
-		workerCount:   workerCount,
-		ctx:           context.Background(),
-		httpServer:    &http.Server{Addr: addr, Handler: mux},
-		mux:           mux,
-		quit:          make(chan struct{}),
-		taskRequestCh: make(chan int, 100),
+	s := &Server{
+		Port:        port,
+		WorkerCount: worker,
+		Delay:       10 * time.Millisecond,
+		httpServer: &http.Server{
+			Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+			Handler: mux,
+		},
+		mux:   mux,
+		log:   log.Default(),
+		wg:    &sync.WaitGroup{},
+		ctx:   context.Background(),
+		quit:  make(chan struct{}),
+		tasks: make(chan *TaskRequest, 100),
 	}
-
 	for _, opt := range opts {
-		opt(server)
+		opt(s)
 	}
-	return server
+	return s
 }
 
-func WithServerShutdownTimeout(t time.Duration) Option {
-	return func(server *Server) {
-		server.timeout = t
-	}
-}
-
-func WithRequestDelay(delay time.Duration) Option {
-	return func(server *Server) {
-		server.requestDelay = delay
+func WithTimeout(timeout time.Duration) ServerOption {
+	return func(s *Server) {
+		s.Timeout = timeout
 	}
 }
 
-func (s *Server) initDB() error {
-	addr := "127.0.0.1:7897"
-	conn, err := net.Dial("tcp", "127.0.0.1:7897")
-	if err != nil {
-		conn = &net.TCPConn{}
-		log.Debug("init mock db")
+func WithDelay(delay time.Duration) ServerOption {
+	return func(s *Server) {
+		s.Delay = delay
 	}
+}
 
-	s.db = &conn
-	log.Info("init db " + addr + " success")
+func (s *Server) initDatabase() error {
+	// mock db
+	s.db = &net.TCPConn{}
+	s.log.Println("init database success!")
 	return nil
 }
 
-func (s *Server) initWorker() {
-	for i := 0; i < s.workerCount; i++ {
-		s.wg.Add(1)
-		go func() {
+func (s *Server) startWorker() {
+	for i := 0; i < s.WorkerCount; i++ {
+		go func(id int) {
+			s.wg.Add(1)
 			defer s.wg.Done()
-			s.worker(i)
-		}()
-	}
-}
+			for {
+				select {
+				case req := <-s.tasks:
+					// 使用 timer 替代 sleep，使其可中途跳出
+					timer := time.NewTimer(s.Delay)
+					select {
+					case <-timer.C:
+						s.log.Println(fmt.Sprintf("worker(%d) taskId:%d processed", id, req.Id))
+					case <-s.quit:
+						timer.Stop()
+						s.log.Println(fmt.Sprintf("close worker(%d) on quit", id))
+						return
+					}
 
-func (s *Server) initCacheWarmer() {
-	go func() {
-		s.wg.Add(1)
-		defer s.wg.Done()
-
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		log.Info("init cache warmer success")
-
-		for {
-			select {
-			case <-ticker.C:
-				time.Sleep(100 * time.Millisecond)
-				log.Info("Running cache ticker")
-			case <-s.ctx.Done():
-				log.Info("Shutting down cache on context done")
-				return
-			case <-s.quit:
-				log.Info("Shutting down cache on quit sigint")
-				return
+				case <-s.quit:
+					s.log.Println(fmt.Sprintf("close worker(%d) on quit", id))
+					return
+				}
 			}
-		}
-	}()
+
+		}(i)
+	}
+	s.log.Println("init workers success!")
 }
 
-func (s *Server) worker(id int) {
-	log.Info(fmt.Sprintf("worker %d starting", id))
-	delay := s.requestDelay
-	if delay == 0 {
-		delay = time.Millisecond * 100
-	}
+func (s *Server) startCache() {
+	s.wg.Add(1)
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	s.log.Println("init cache ticker success!")
+
 	for {
 		select {
-		case req := <-s.taskRequestCh:
-			time.Sleep(delay)
-			log.Info(fmt.Sprintf("worker %d finished task: %d", id, req))
+		case <-ticker.C:
+			s.log.Println("ticker(30s) finished")
+		case <-s.ctx.Done():
+			s.log.Println("close cache ticker on context done")
+			return
 		case <-s.quit:
-			log.Info(fmt.Sprintf("worker %d shutting down", id))
+			s.log.Println("close cache ticker on quit")
 			return
 		}
 	}
-}
 
-func (s *Server) Handle(w http.ResponseWriter, _ *http.Request) {
-	select {
-	case s.taskRequestCh <- 1:
-		w.WriteHeader(http.StatusAccepted)
-	default:
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}
-}
-
-func (s *Server) listenQuit() {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigCh:
-		log.Info(fmt.Sprintf("Received signal %v, stopping...", sig))
-	}
-
-	if err := s.Stop(s.ctx); err != nil {
-		panic(fmt.Sprintf("Force exit: %v", err))
-	}
 }
 
 func (s *Server) Start() error {
 
-	// 数据库连接池
-	if err := s.initDB(); err != nil {
-		return fmt.Errorf("init db: %w", err)
+	// 启动数据库
+	if err := s.initDatabase(); err != nil {
+		s.log.Println("init database error: ", err.Error())
+		return err
 	}
 
-	// worker
-	s.initWorker()
+	// 启动worker
+	s.startWorker()
 
-	// 缓存预热器
-	s.initCacheWarmer()
+	// 启动缓存预热
+	go s.startCache()
 
-	// 设置 http 服务器
-	s.mux.HandleFunc("/task", s.Handle)
-	//http.HandleFunc("/task", s.Handle)
+	// 启动http服务器
+	s.mux.HandleFunc("/task", func(writer http.ResponseWriter, request *http.Request) {
+		idStr := request.URL.Query().Get("id")
+		id, _ := strconv.Atoi(idStr)
 
-	errCh := make(chan error, 1)
+		select {
+		case s.tasks <- &TaskRequest{Id: id}:
+			writer.WriteHeader(http.StatusAccepted)
+		default:
+			writer.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+
 	go func() {
-		log.Info(fmt.Sprintf("http server listening on %s", s.addr))
-		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("listen server error: %s", err)
+		if err := s.httpServer.ListenAndServe(); err != nil {
+			s.log.Println("ListenAndServe error: ", err.Error())
 		}
 	}()
 
@@ -187,19 +170,18 @@ func (s *Server) Start() error {
 
 	select {
 	case sig := <-sigCh:
-		log.Info(fmt.Sprintf("Received signal %v, stopping...", sig))
-		return s.Stop(s.ctx)
-	case err := <-errCh:
-		log.Error(fmt.Sprintf("Received signal, %s", err.Error()))
+		s.log.Println(fmt.Sprintf("Received signal %v, stopping...", sig))
 		return s.Stop(s.ctx)
 	}
 
 }
 
 func (s *Server) Stop(ctx context.Context) error {
-
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	if s.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
+		defer cancel()
+	}
 
 	// 停止接收新请求
 	if err := s.httpServer.Shutdown(ctx); err != nil {
@@ -207,7 +189,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 
 	// 关闭 worker 和 缓存预热器
-	close(s.quit)
+	s.closeOnce.Do(func() {
+		close(s.quit)
+	})
 
 	// 等待所有协程完成当前工作
 	done := make(chan struct{})
@@ -218,19 +202,18 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	select {
 	case <-done:
-		log.Info("all workers shutdown success")
+		s.log.Println("all workers shutdown success")
 	case <-ctx.Done():
 		return fmt.Errorf("shutdown timeout")
 	}
 
 	// 关闭基础资源
-	log.Info("db.close() success")
+	s.log.Println("db.close() success")
 	return nil
 }
 
 func main() {
-
-	srv := NewServer("127.0.0.1:7890", 4, WithServerShutdownTimeout(time.Second*10))
+	srv := NewServer(8001, 4, WithTimeout(10*time.Second))
 	if err := srv.Start(); err != nil {
 		panic(err)
 	}

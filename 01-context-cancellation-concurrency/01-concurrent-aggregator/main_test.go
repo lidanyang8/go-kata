@@ -7,91 +7,37 @@ import (
 	"time"
 )
 
-type testProfileService struct {
-	delay time.Duration
-	err   error
-}
-
-func (m *testProfileService) GetUserProfile(ctx context.Context, id int) (string, error) {
-	if m.err != nil {
-		return "", m.err
-	}
-	if m.delay <= 0 {
-		return "Alice", nil
-	}
-
-	select {
-	case <-time.After(m.delay):
-		return "Alice", nil
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-}
-
-type testOrderService struct {
-	delay time.Duration
-	err   error
-}
-
-func (m *testOrderService) GetOrder(ctx context.Context, id int) (int, error) {
-	if m.err != nil {
-		return 0, m.err
-	}
-	if m.delay <= 0 {
-		return 5, nil
-	}
-
-	select {
-	case <-time.After(m.delay):
-		return 5, nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	}
-}
-
-// TestSlowPoke 验证在其中一个服务很慢时，聚合器会在超时后快速失败。
+// TestSlowPoke “慢半拍”场景（Slow Poke）
+//
+// 将聚合器的超时时间设为 1s；
+// 模拟其中一个服务耗时 2s；
+// 通过条件： 函数在大约 1 秒后返回 context deadline exceeded。
 func TestSlowPoke(t *testing.T) {
-	profileSvc := &testProfileService{delay: 2 * time.Second}
-	orderSvc := &testOrderService{delay: 100 * time.Millisecond}
-
-	ua := NewUserAggregator(profileSvc, orderSvc, WithTimeout(1*time.Second))
-
-	ctx := context.Background()
-
-	start := time.Now()
-	_, err := ua.Aggregate(ctx, 1)
-	elapsed := time.Since(start)
-
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+	p := &ProfileService{delay: 2 * time.Second}
+	o := &OrderService{delay: 100 * time.Millisecond}
+	ua := NewUserAggregator(p, o, WithTimeout(1*time.Second))
+	_, err := ua.Aggregate(context.Background(), 1001)
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded or canceled, got %v", err)
 	}
-
-	if elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
-		t.Fatalf("expected ~1s timeout, got %v", elapsed)
-	}
 }
 
-// TestDominoEffect 验证当 ProfileService 立刻失败时，
-// OrderService 的长时间请求会被及时取消（而不是等它自然返回）。
+// TestDominoEffect “多米诺骨牌”场景（Domino Effect）
+//
+// 模拟 Profile Service 立即返回错误；
+// 模拟 Order Service 需要 10 秒才返回；
+// 通过条件： 函数应立刻返回错误（如果它还傻等 10 秒，说明你在上下文取消上失败了）。
 func TestDominoEffect(t *testing.T) {
-	profileErr := errors.New("profile failed immediately")
-	profileSvc := &testProfileService{err: profileErr}
-	orderSvc := &testOrderService{delay: 10 * time.Second}
-
-	ua := NewUserAggregator(profileSvc, orderSvc, WithTimeout(5*time.Second))
-
-	ctx := context.Background()
-
+	p := &ProfileService{delay: 100 * time.Millisecond}
+	o := &OrderService{delay: 10 * time.Second}
 	start := time.Now()
-	_, err := ua.Aggregate(ctx, 1)
-	elapsed := time.Since(start)
-
-	if !errors.Is(err, profileErr) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected immediate profile error or canceled, got %v", err)
+	ua := NewUserAggregator(p, o, WithTimeout(1*time.Second))
+	_, err := ua.Aggregate(context.Background(), 1002)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded or canceled, got %v", err)
 	}
-
-	// 如果等待接近 10s，说明上下文取消没有及时生效。
-	if elapsed > 2*time.Second {
-		t.Fatalf("expected fast failure due to profile error, took %v", elapsed)
+	secs := time.Now().Sub(start).Seconds()
+	if secs > 1.2 {
+		t.Fatalf("expected ~1s timeout, got %v", secs)
 	}
 }

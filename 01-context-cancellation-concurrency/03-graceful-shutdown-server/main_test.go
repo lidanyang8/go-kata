@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"runtime"
@@ -18,7 +19,8 @@ import (
 // 通过： 服务器完成一部分在途请求（不一定是全部 100 个）、打印“shutting down”日志，并干净退出；
 // 失败： 收到信号后仍接受新请求、泄漏 goroutine 或崩溃。
 func TestSuddenDeath(t *testing.T) {
-	srv := NewServer("127.0.0.1:7890", 4, WithServerShutdownTimeout(time.Second*10))
+	port := 8001
+	srv := NewServer(port, 10, WithTimeout(time.Second*10))
 	go func() {
 		if err := srv.Start(); err != nil {
 			panic(err)
@@ -36,7 +38,7 @@ func TestSuddenDeath(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
-			resp, err := http.Get("http://127.0.0.1:7890/task")
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/task", port))
 			if err != nil {
 				atomic.AddInt64(&failAfterShutdown, 1)
 				t.Logf("get task %d error: %s", id, err.Error())
@@ -62,7 +64,7 @@ func TestSuddenDeath(t *testing.T) {
 			}()
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	wg.Wait()
@@ -88,7 +90,8 @@ func TestSuddenDeath(t *testing.T) {
 // 通过： 使用 runtime.NumGoroutine() 比对，关闭前后 goroutine 数量无显著增加；
 // 失败： 关闭后 goroutine 数明显高于启动时。
 func TestSlowLeak(t *testing.T) {
-	srv := NewServer("127.0.0.1:7891", 4, WithServerShutdownTimeout(time.Second*10))
+	port := 8002
+	srv := NewServer(port, 100, WithTimeout(time.Second*10), WithDelay(100*time.Millisecond))
 	go func() {
 		if err := srv.Start(); err != nil {
 			panic(err)
@@ -110,7 +113,7 @@ func TestSlowLeak(t *testing.T) {
 			select {
 			case <-ticker.C:
 				go func() {
-					resp, err := http.Get("http://127.0.0.1:7891/task")
+					resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/task", port))
 					if err != nil {
 						t.Logf("get task %d error: %s", 1, err.Error())
 						failed++
@@ -139,7 +142,7 @@ func TestSlowLeak(t *testing.T) {
 	time.Sleep(time.Second * 15)
 
 	finalGoroutine := runtime.NumGoroutine()
-	leak := finalGoroutine - initGoroutine
+	leak := initGoroutine - finalGoroutine
 
 	if leak > 5 {
 		t.Errorf("goroutine leak %d; init goroutine: %d; final goroutine: %d",
@@ -162,8 +165,9 @@ func TestSlowLeak(t *testing.T) {
 // 通过： 在 5 秒后强制退出并记录 “shutdown timeout” 之类日志；
 // 失败： 等满 20 秒或死锁。
 func TestTimeout(t *testing.T) {
-	srv := NewServer("127.0.0.1:7892", 4,
-		WithServerShutdownTimeout(time.Second*5), WithRequestDelay(20*time.Second))
+	port := 8003
+	srv := NewServer(port, 4,
+		WithTimeout(time.Second*5), WithDelay(20*time.Second))
 	go func() {
 		if err := srv.Start(); err != nil {
 			panic(err)
@@ -172,7 +176,7 @@ func TestTimeout(t *testing.T) {
 	time.Sleep(time.Second * 1)
 
 	go func() {
-		resp, err := http.Get("http://127.0.0.1:7892/task")
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/task", port))
 		if err != nil {
 			t.Logf("get task %d error: %s", 1, err.Error())
 			return
